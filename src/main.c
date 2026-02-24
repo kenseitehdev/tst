@@ -1,3 +1,19 @@
+/*
+ * tst - a CLI tool for test running, benchmarking, and load testing
+ *
+ * Usage:
+ *   tst <executable> test  [filter]  - run tests, $TST_BIN set to executable
+ *   tst <executable> bench [filter]  - benchmark tests
+ *   tst <executable> load  [filter]  - load test with ramp up/down
+ *   tst help
+ *
+ * Test discovery: recurse ./tests/, run everything executable
+ * Pass/fail: exit code 0 = pass, non-zero = fail;
+ *            stdout "PASS"/"FAIL" also parsed
+ *
+ * Build: gcc -O2 -pthread -o tst main.c
+ */
+
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -73,6 +89,7 @@ typedef struct {
 /* ─── globals ────────────────────────────────────────────────────── */
 
 static char   g_tests_dir[MAX_PATH] = "tests";
+static char   g_bin[MAX_PATH]       = "";      /* path to executable under test */
 static char   g_test_paths[MAX_TESTS][MAX_PATH];
 static int    g_test_count = 0;
 static TestResult g_results[MAX_TESTS];
@@ -139,6 +156,9 @@ static TestResult run_one(const char *path) {
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
+        /* expose the binary under test so test scripts can invoke it */
+        if (g_bin[0] != '\0')
+            setenv("TST_BIN", g_bin, 1);
         execl(path, path, NULL);
         _exit(127);
     }
@@ -493,16 +513,18 @@ static int cmd_load(const char *filter) {
 static void usage(void) {
     printf(C_BOLD "tst v%s" C_RESET " — test runner, benchmarker, load tester\n\n", TST_VERSION);
     printf("  " C_BOLD "usage:" C_RESET "\n");
-    printf("    tst                     run all tests\n");
-    printf("    tst test [filter]       run tests (optional name filter)\n");
-    printf("    tst bench [filter]      benchmark tests\n");
-    printf("    tst load [filter]       load test with ramp up/down\n");
-    printf("    tst help                show this help\n\n");
+    printf("    tst <executable> test  [filter]   run tests ($TST_BIN set to executable)\n");
+    printf("    tst <executable> bench [filter]   benchmark tests\n");
+    printf("    tst <executable> load  [filter]   load test with ramp up/down\n");
+    printf("    tst help                           show this help\n\n");
     printf("  " C_BOLD "options:" C_RESET "\n");
-    printf("    -d <dir>                tests directory (default: ./tests)\n\n");
-    printf("  " C_BOLD "test discovery:" C_RESET "\n");
-    printf("    recursively finds all executable files in the tests dir\n");
-    printf("    works with any language: sh, py, js, ts, lua, compiled C...\n\n");
+    printf("    -d <dir>                           tests directory (default: ./tests)\n\n");
+    printf("  " C_BOLD "example:" C_RESET "\n");
+    printf("    tst bin/myapp test                 run all tests with $TST_BIN=bin/myapp\n");
+    printf("    tst bin/myapp bench math           run bench on tests matching 'math'\n");
+    printf("    tst bin/myapp load api             load test tests matching 'api'\n\n");
+    printf("  " C_BOLD "in your test scripts:" C_RESET "\n");
+    printf("    result=$(\"$TST_BIN\" --some-flag)   invoke the binary under test\n\n");
     printf("  " C_BOLD "pass/fail:" C_RESET "\n");
     printf("    exit code 0 = pass, non-zero = fail\n");
     printf("    stdout containing FAIL overrides to fail\n");
@@ -514,7 +536,7 @@ static void usage(void) {
 int main(int argc, char *argv[]) {
     int i = 1;
 
-    /* parse -d flag */
+    /* parse flags */
     while (i < argc && argv[i][0] == '-') {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             strncpy(g_tests_dir, argv[++i], MAX_PATH - 1);
@@ -523,17 +545,35 @@ int main(int argc, char *argv[]) {
     }
 
     if (i >= argc) {
-        return cmd_test(NULL);
+        usage();
+        return 1;
     }
 
-    const char *cmd = argv[i++];
+    /* tst help */
+    if (strcmp(argv[i], "help") == 0) { usage(); return 0; }
+
+    /* tst <executable> <subcommand> [filter] */
+    if (i + 1 >= argc) {
+        fprintf(stderr, "tst: expected: tst <executable> <test|bench|load> [filter]\n");
+        fprintf(stderr, "     try: tst help\n");
+        return 1;
+    }
+
+    strncpy(g_bin, argv[i++], MAX_PATH - 1);
+
+    /* validate the binary exists and is executable */
+    if (access(g_bin, X_OK) != 0) {
+        fprintf(stderr, "tst: '%s' is not executable or not found\n", g_bin);
+        return 1;
+    }
+
+    const char *cmd    = argv[i++];
     const char *filter = (i < argc) ? argv[i] : NULL;
 
     if (strcmp(cmd, "test")  == 0) return cmd_test(filter);
     if (strcmp(cmd, "bench") == 0) return cmd_bench(filter);
     if (strcmp(cmd, "load")  == 0) return cmd_load(filter);
-    if (strcmp(cmd, "help")  == 0) { usage(); return 0; }
 
-    fprintf(stderr, "tst: unknown command '%s'. Try: tst help\n", cmd);
+    fprintf(stderr, "tst: unknown subcommand '%s'. Try: tst help\n", cmd);
     return 1;
 }
