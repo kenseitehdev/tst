@@ -11,7 +11,7 @@
  * Pass/fail: exit code 0 = pass, non-zero = fail;
  *            stdout "PASS"/"FAIL" also parsed
  *
- * Build: gcc -O2 -pthread -o tst main.c
+ * Build: gcc -O2 -pthread -o tst main.c -lm
  */
 
 #define _GNU_SOURCE
@@ -89,7 +89,7 @@ typedef struct {
 /* ─── globals ────────────────────────────────────────────────────── */
 
 static char   g_tests_dir[MAX_PATH] = "tests";
-static char   g_bin[MAX_PATH]       = "";      /* path to executable under test */
+static char   g_bin[MAX_PATH]       = "";
 static char   g_test_paths[MAX_TESTS][MAX_PATH];
 static int    g_test_count = 0;
 static TestResult g_results[MAX_TESTS];
@@ -109,6 +109,51 @@ static int cmp_double(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
+/* ─── progress bar ───────────────────────────────────────────────── */
+
+#define PBAR_WIDTH 35
+
+/*
+ * Draw an animated in-place progress bar on stderr.
+ *
+ *   label    : short label shown before the bar (max ~18 chars looks good)
+ *   current  : how many steps done so far
+ *   total    : total steps
+ *   extra    : optional suffix string (pass NULL for none), e.g. "run 4/100"
+ *
+ * Call with current == total to finalise (prints newline and clears).
+ * All output goes to stderr so it doesn't pollute stdout/piped output.
+ */
+static void draw_bar(const char *label, int current, int total, const char *extra) {
+    int filled = (total > 0) ? (current * PBAR_WIDTH) / total : PBAR_WIDTH;
+    int pct    = (total > 0) ? (current * 100)        / total : 100;
+
+    fprintf(stderr, "\r  " C_BOLD "%-16s" C_RESET " [", label);
+    for (int i = 0; i < PBAR_WIDTH; i++) {
+        if (i < filled)
+            fprintf(stderr, C_CYAN "█" C_RESET);
+        else
+            fprintf(stderr, C_DIM "░" C_RESET);
+    }
+    fprintf(stderr, "] " C_BOLD "%3d%%" C_RESET, pct);
+    if (extra)
+        fprintf(stderr, C_DIM "  %s" C_RESET, extra);
+    /* pad to overwrite any leftover chars from a longer previous line */
+    fprintf(stderr, "   ");
+    fflush(stderr);
+
+    if (current >= total) {
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
+/* Clear the current bar line (call before printing normal output mid-loop) */
+static void clear_bar(void) {
+    fprintf(stderr, "\r\033[2K");
+    fflush(stderr);
+}
+
 /* ─── discovery ──────────────────────────────────────────────────── */
 
 static void discover(const char *dir) {
@@ -125,11 +170,10 @@ static void discover(const char *dir) {
         struct stat st;
         if (stat(full, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            discover(full);  /* recurse */
+            discover(full);
         } else if (S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR)) {
-            if (g_test_count < MAX_TESTS) {
+            if (g_test_count < MAX_TESTS)
                 strncpy(g_test_paths[g_test_count++], full, MAX_PATH - 1);
-            }
         }
     }
     closedir(d);
@@ -141,8 +185,6 @@ static TestResult run_one(const char *path) {
     TestResult r;
     memset(&r, 0, sizeof(r));
     strncpy(r.path, path, MAX_PATH - 1);
-
-    /* name = relative path from cwd */
     strncpy(r.name, path, MAX_PATH - 1);
 
     int pipefd[2];
@@ -151,12 +193,10 @@ static TestResult run_one(const char *path) {
     double t0 = now_ms();
     pid_t pid = fork();
     if (pid == 0) {
-        /* child */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
-        /* expose the binary under test so test scripts can invoke it */
         if (g_bin[0] != '\0')
             setenv("TST_BIN", g_bin, 1);
         execl(path, path, NULL);
@@ -164,41 +204,32 @@ static TestResult run_one(const char *path) {
     }
     close(pipefd[1]);
 
-    /* read stdout */
     ssize_t n = 0, total = 0;
     while ((n = read(pipefd[0], r.stdout_buf + total,
-                     OUTPUT_BUF - 1 - total)) > 0) {
+                     OUTPUT_BUF - 1 - total)) > 0)
         total += n;
-    }
     r.stdout_buf[total] = '\0';
     close(pipefd[0]);
 
-    /* wait + rusage */
     struct rusage usage;
     int status;
     wait4(pid, &status, 0, &usage);
     r.wall_ms  = now_ms() - t0;
-    r.mem_kb   = usage.ru_maxrss;  /* KB on Linux, bytes on macOS */
+    r.mem_kb   = usage.ru_maxrss;
 #ifdef __APPLE__
     r.mem_kb /= 1024.0;
 #endif
 
     r.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 
-    /* pass logic: exit 0 AND no "FAIL" in stdout */
-    bool exit_ok   = (r.exit_code == 0);
-    bool stdout_ok = (strstr(r.stdout_buf, "FAIL") == NULL);
+    bool exit_ok     = (r.exit_code == 0);
     bool stdout_pass = (strstr(r.stdout_buf, "PASS") != NULL);
+    bool stdout_fail = (strstr(r.stdout_buf, "FAIL") != NULL);
+    (void)exit_ok;
 
-    /* if stdout says PASS explicitly, trust it; else rely on exit code */
-    if (stdout_pass) {
-        r.pass = true;
-    } else if (strstr(r.stdout_buf, "FAIL")) {
-        r.pass = false;
-    } else {
-        r.pass = exit_ok;
-    }
-    (void)stdout_ok;
+    if (stdout_pass)      r.pass = true;
+    else if (stdout_fail) r.pass = false;
+    else                  r.pass = (r.exit_code == 0);
 
     return r;
 }
@@ -213,7 +244,6 @@ static void print_result(const TestResult *r) {
     if (!r->pass) {
         printf("       " C_DIM "└─ exit: %d\n" C_RESET, r->exit_code);
         if (r->stdout_buf[0]) {
-            /* print first line of stdout */
             char tmp[256];
             strncpy(tmp, r->stdout_buf, 255);
             tmp[255] = '\0';
@@ -241,7 +271,6 @@ static void print_dot_grid(TestResult *results, int count) {
         else
             printf(C_RED "○" C_RESET " ");
         if ((i + 1) % GRID_COLS == 0 || i == count - 1) {
-            /* pad remaining */
             int rem = GRID_COLS - ((i % GRID_COLS) + 1);
             for (int j = 0; j < rem; j++) printf("  ");
             printf("│\n");
@@ -265,7 +294,6 @@ static void print_bench_timeline(const BenchResult *b, int runs) {
         if (b->timeline[i] > max_ms) max_ms = b->timeline[i];
     if (max_ms == 0) return;
 
-    /* 5 rows */
     int rows = 5;
     printf("  ");
     for (int r = rows; r >= 1; r--) {
@@ -298,29 +326,43 @@ static int cmd_test(const char *filter) {
     int pass = 0, fail = 0;
     double total_ms = 0;
 
+    /* count how many we'll actually run (for the bar) */
+    int to_run = 0;
+    for (int i = 0; i < g_test_count; i++)
+        if (!filter || strstr(g_test_paths[i], filter))
+            to_run++;
+
+    int done = 0;
     for (int i = 0; i < g_test_count; i++) {
         if (filter && strstr(g_test_paths[i], filter) == NULL) continue;
+
+        char extra[32];
+        snprintf(extra, sizeof(extra), "%d/%d", done + 1, to_run);
+        draw_bar("Running tests", done, to_run, extra);
+
         g_results[i] = run_one(g_test_paths[i]);
+        done++;
+
+        /* clear bar, print result, then redraw bar */
+        clear_bar();
         print_result(&g_results[i]);
+
         if (g_results[i].pass) pass++; else fail++;
         total_ms += g_results[i].wall_ms;
     }
+    draw_bar("Running tests", to_run, to_run, NULL);
 
-    /* separator */
     printf("\n  " C_DIM);
     for (int i = 0; i < 60; i++) printf("─");
     printf(C_RESET "\n");
 
-    /* summary */
     printf("  " C_BOLD "%d tests" C_RESET "  "
            C_GREEN "%d passed" C_RESET "  "
            C_RED "%d failed" C_RESET "  "
            C_DIM "%.0fms total\n" C_RESET,
            pass + fail, pass, fail, total_ms);
 
-    /* dot grid */
     print_dot_grid(g_results, pass + fail);
-
     printf("\n");
     return fail > 0 ? 1 : 0;
 }
@@ -349,19 +391,24 @@ static int cmd_bench(const char *filter) {
         printf("  " C_BOLD "[bench]" C_RESET " %s\n", g_test_paths[i]);
 
         for (int r = 0; r < BENCH_RUNS; r++) {
+            char extra[32];
+            snprintf(extra, sizeof(extra), "run %d/%d", r + 1, BENCH_RUNS);
+            draw_bar("Benchmarking", r, BENCH_RUNS, extra);
+
             TestResult tr = run_one(g_test_paths[i]);
-            times[r] = tr.wall_ms;
-            b.timeline[r] = tr.wall_ms;
-            mem_total += tr.mem_kb;
+            times[r]       = tr.wall_ms;
+            b.timeline[r]  = tr.wall_ms;
+            mem_total      += tr.mem_kb;
             if (tr.wall_ms < b.min_ms) b.min_ms = tr.wall_ms;
             if (tr.wall_ms > b.max_ms) b.max_ms = tr.wall_ms;
             b.avg_ms += tr.wall_ms;
         }
-        b.runs      = BENCH_RUNS;
-        b.avg_ms   /= BENCH_RUNS;
+        draw_bar("Benchmarking", BENCH_RUNS, BENCH_RUNS, NULL);
+
+        b.runs       = BENCH_RUNS;
+        b.avg_ms    /= BENCH_RUNS;
         b.avg_mem_kb = mem_total / BENCH_RUNS;
 
-        /* stddev */
         double var = 0;
         for (int r = 0; r < BENCH_RUNS; r++)
             var += (times[r] - b.avg_ms) * (times[r] - b.avg_ms);
@@ -420,7 +467,6 @@ static LoadStep run_load_step(const char *path, int workers) {
     for (int i = 0; i < workers; i++)
         if (!ok[i]) s.errors++;
 
-    /* percentiles */
     double *sorted = malloc(workers * sizeof(double));
     memcpy(sorted, ms, workers * sizeof(double));
     qsort(sorted, workers, sizeof(double), cmp_double);
@@ -444,6 +490,9 @@ static int cmd_load(const char *filter) {
 
     printf(C_BOLD "\ntst v%s" C_RESET "  " C_DIM "load runner\n\n" C_RESET, TST_VERSION);
 
+    /* total steps = ramp up (LOAD_RAMP_STEPS) + ramp down (LOAD_RAMP_STEPS - 1) */
+    int total_steps = LOAD_RAMP_STEPS + (LOAD_RAMP_STEPS - 1);
+
     for (int i = 0; i < g_test_count; i++) {
         if (filter && strstr(g_test_paths[i], filter) == NULL) continue;
 
@@ -458,30 +507,70 @@ static int cmd_load(const char *filter) {
         for (int j = 0; j < 56; j++) printf("─");
         printf(C_RESET "\n");
 
-        /* timeline data for chart */
         double tl_rps[LOAD_RAMP_STEPS * 2];
-        int    tl_n = 0;
+        int    tl_n   = 0;
+        int    step_n = 0;
 
         /* ramp UP */
         for (int step = 1; step <= LOAD_RAMP_STEPS; step++) {
             int w = (int)(1 + (double)(LOAD_MAX_WORKERS - 1) *
                           step / LOAD_RAMP_STEPS);
+
+            char extra[40];
+            snprintf(extra, sizeof(extra), "↑ %d workers  step %d/%d",
+                     w, step_n + 1, total_steps);
+            draw_bar("Load testing", step_n, total_steps, extra);
+
             LoadStep s = run_load_step(g_test_paths[i], w);
             tl_rps[tl_n++] = s.rps;
+            step_n++;
+
+            /* clear bar, print result row, sleep indicator */
+            clear_bar();
             printf("  %-8d  %-8.1f  %-7.1fms  %-7.1fms  %-7.1fms  %.1f%%\n",
                    w, s.rps, s.p50_ms, s.p95_ms, s.p99_ms, s.error_pct);
-            sleep(LOAD_STEP_SECS);
+
+            if (step < LOAD_RAMP_STEPS) {
+                /* show a little "waiting" bar during the sleep */
+                for (int t = 0; t < LOAD_STEP_SECS; t++) {
+                    char wextra[32];
+                    snprintf(wextra, sizeof(wextra), "cooldown %ds", LOAD_STEP_SECS - t);
+                    draw_bar("Waiting", t, LOAD_STEP_SECS, wextra);
+                    sleep(1);
+                }
+                clear_bar();
+            }
         }
+
         /* ramp DOWN */
         for (int step = LOAD_RAMP_STEPS - 1; step >= 1; step--) {
             int w = (int)(1 + (double)(LOAD_MAX_WORKERS - 1) *
                           step / LOAD_RAMP_STEPS);
+
+            char extra[40];
+            snprintf(extra, sizeof(extra), "↓ %d workers  step %d/%d",
+                     w, step_n + 1, total_steps);
+            draw_bar("Load testing", step_n, total_steps, extra);
+
             LoadStep s = run_load_step(g_test_paths[i], w);
             tl_rps[tl_n++] = s.rps;
+            step_n++;
+
+            clear_bar();
             printf("  %-8d  %-8.1f  %-7.1fms  %-7.1fms  %-7.1fms  %.1f%%\n",
                    w, s.rps, s.p50_ms, s.p95_ms, s.p99_ms, s.error_pct);
-            sleep(LOAD_STEP_SECS);
+
+            if (step > 1) {
+                for (int t = 0; t < LOAD_STEP_SECS; t++) {
+                    char wextra[32];
+                    snprintf(wextra, sizeof(wextra), "cooldown %ds", LOAD_STEP_SECS - t);
+                    draw_bar("Waiting", t, LOAD_STEP_SECS, wextra);
+                    sleep(1);
+                }
+                clear_bar();
+            }
         }
+        draw_bar("Load testing", total_steps, total_steps, NULL);
 
         /* rps timeline chart */
         printf("\n  " C_BOLD "rps timeline" C_RESET C_DIM
@@ -536,23 +625,16 @@ static void usage(void) {
 int main(int argc, char *argv[]) {
     int i = 1;
 
-    /* parse flags */
     while (i < argc && argv[i][0] == '-') {
-        if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "-d") == 0 && i + 1 < argc)
             strncpy(g_tests_dir, argv[++i], MAX_PATH - 1);
-        }
         i++;
     }
 
-    if (i >= argc) {
-        usage();
-        return 1;
-    }
+    if (i >= argc) { usage(); return 1; }
 
-    /* tst help */
     if (strcmp(argv[i], "help") == 0) { usage(); return 0; }
 
-    /* tst <executable> <subcommand> [filter] */
     if (i + 1 >= argc) {
         fprintf(stderr, "tst: expected: tst <executable> <test|bench|load> [filter]\n");
         fprintf(stderr, "     try: tst help\n");
@@ -561,7 +643,6 @@ int main(int argc, char *argv[]) {
 
     strncpy(g_bin, argv[i++], MAX_PATH - 1);
 
-    /* validate the binary exists and is executable */
     if (access(g_bin, X_OK) != 0) {
         fprintf(stderr, "tst: '%s' is not executable or not found\n", g_bin);
         return 1;
